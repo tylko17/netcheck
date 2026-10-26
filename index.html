@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network check</title>
+<style>
+  body { font: 16px/1.4 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #111; }
+  h1 { font-size: 1.4rem; margin-bottom: .2rem; }
+  p.sub { color: #555; margin-top: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  td, th { text-align: left; padding: .45rem .4rem; border-bottom: 1px solid #ddd; vertical-align: top; }
+  th { font-size: .8rem; text-transform: uppercase; color: #666; }
+  .host { font-family: ui-monospace, monospace; font-size: .8rem; color: #666; }
+  .ok { color: #0a7a2f; font-weight: 600; }
+  .bad { color: #b00020; font-weight: 600; }
+  .maybe { color: #9a6700; font-weight: 600; }
+  .wait { color: #888; }
+  button { font: inherit; padding: .5rem .9rem; border-radius: 6px; border: 1px solid #888; background: #f4f4f4; cursor: pointer; }
+  button.primary { background: #111; color: #fff; border-color: #111; }
+  .row-btns button { padding: .2rem .5rem; font-size: .85rem; }
+  .row-btns button.sel { background: #111; color: #fff; }
+  textarea { width: 100%; height: 12rem; font: 12px ui-monospace, monospace; }
+  .note { font-size: .85rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>Network check</h1>
+<p class="sub">Open this on a school Chromebook on school wifi. Part 1 runs on its own. Part 2 needs you to click links. Then hit <b>Copy results</b> and send them back.</p>
+
+<h2>1. Automatic tests</h2>
+<button class="primary" id="run">Run again</button>
+<table>
+  <thead><tr><th>Service</th><th>Result</th></tr></thead>
+  <tbody id="auto"></tbody>
+</table>
+<p class="note"><b>✅ yes</b> = real response came back. <b>⚠️ probably</b> = something answered, but it could be a block page (confirm in part 2). <b>❌ blocked</b> = request was stopped or timed out.</p>
+
+<h2>2. Open each link in a new tab</h2>
+<p class="note">Click a link, see whether the real site or a block page shows up, close the tab, then mark it here.</p>
+<table>
+  <thead><tr><th>Link</th><th>What did you see?</th></tr></thead>
+  <tbody id="manual"></tbody>
+</table>
+
+<h2>3. Send results</h2>
+<button class="primary" id="copy">Copy results</button>
+<p><textarea id="out" readonly></textarea></p>
+
+<script>
+const TIMEOUT = 8000;
+
+// kind "json": CORS request whose body must be a real Google API error object.
+// kind "img":  must decode as an image, so a filter's HTML block page fails.
+// kind "weak": no-cors fetch; only proves *something* answered.
+const AUTO = [
+  { name: "Firestore database (Firebase)", kind: "json", url: "https://firestore.googleapis.com/v1/projects/netcheck-probe-x/databases/(default)/documents/x" },
+  { name: "Firebase Auth / sign-in", kind: "json", url: "https://identitytoolkit.googleapis.com/v1/projects" },
+  { name: "Google Apps Script", kind: "img", url: "https://script.google.com/favicon.ico" },
+  { name: "googleusercontent.com", kind: "img", url: "https://lh3.googleusercontent.com/favicon.ico" },
+  { name: "gstatic.com (Google files)", kind: "img", url: "https://www.gstatic.com/images/branding/product/1x/googleg_32dp.png" },
+  { name: "firebase.google.com", kind: "img", url: "https://firebase.google.com/static/images/brand-guidelines/logo-logomark.png" },
+  { name: "Firebase Hosting (*.firebaseapp.com)", kind: "weak", url: "https://fir-ui-demo-84a6c.firebaseapp.com/" },
+  { name: "Vercel (*.vercel.app)", kind: "img", url: "https://shadcn-ui.vercel.app/favicon.ico" },
+  { name: "Netlify (*.netlify.app)", kind: "img", url: "https://astro-docs.netlify.app/favicon.svg" },
+  { name: "Cloudflare Pages (*.pages.dev)", kind: "weak", url: "https://hello-world.pages.dev/" },
+  { name: "Replit", kind: "img", url: "https://replit.com/public/icons/favicon-prompt-192.png" },
+  { name: "GitHub", kind: "img", url: "https://docs.github.com/assets/cb-345/images/site/favicon.png" },
+  { name: "Supabase", kind: "weak", url: "https://api.supabase.com/" },
+  { name: "Fly.io (acadec.fly.dev)", kind: "weak", url: "https://acadec.fly.dev/" },
+];
+
+const MANUAL = [
+  { name: "AcDec on Fly", url: "https://acadec.fly.dev/" },
+  { name: "Firebase Hosting site", url: "https://fir-ui-demo-84a6c.firebaseapp.com/" },
+  { name: "Vercel site", url: "https://shadcn-ui.vercel.app/" },
+  { name: "Netlify site", url: "https://astro-docs.netlify.app/" },
+  { name: "Cloudflare Pages site", url: "https://hello-world.pages.dev/" },
+  { name: "Another github.io site", url: "https://pages.github.com/" },
+  { name: "Google Apps Script", url: "https://script.google.com/home" },
+];
+
+const results = {};
+const manual = {};
+
+function withTimeout(promise) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), TIMEOUT))]);
+}
+
+function probeImg(url) {
+  return withTimeout(new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res("ok");
+    img.onerror = () => rej(new Error("did not load as an image"));
+    img.src = url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
+  }));
+}
+
+async function probeJson(url) {
+  const r = await withTimeout(fetch(url, { cache: "no-store" }));
+  const body = await r.json();
+  if (!body || !body.error) throw new Error("unexpected body (HTTP " + r.status + ")");
+  return "ok";
+}
+
+async function probeWeak(url) {
+  await withTimeout(fetch(url, { mode: "no-cors", cache: "no-store" }));
+  return "maybe";
+}
+
+function render() {
+  const tb = document.getElementById("auto");
+  tb.innerHTML = "";
+  for (const t of AUTO) {
+    const r = results[t.name];
+    let cell = '<span class="wait">testing…</span>';
+    if (r) {
+      if (r.status === "ok") cell = '<span class="ok">✅ yes</span>';
+      else if (r.status === "maybe") cell = '<span class="maybe">⚠️ probably</span>';
+      else cell = '<span class="bad">❌ blocked</span> <span class="host">' + r.detail + "</span>";
+    }
+    const host = new URL(t.url).host;
+    tb.insertAdjacentHTML("beforeend", `<tr><td>${t.name}<div class="host">${host}</div></td><td>${cell}</td></tr>`);
+  }
+  renderOut();
+}
+
+function renderManual() {
+  const tb = document.getElementById("manual");
+  tb.innerHTML = "";
+  MANUAL.forEach((m, i) => {
+    const btn = (v, label) => `<button data-i="${i}" data-v="${v}" class="${manual[m.name] === v ? "sel" : ""}">${label}</button>`;
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td><a href="${m.url}" target="_blank" rel="noopener">${m.name}</a><div class="host">${new URL(m.url).host}</div></td>
+       <td class="row-btns">${btn("loaded", "Real site")} ${btn("blocked", "Block page")} ${btn("error", "Error / blank")}</td></tr>`);
+  });
+  renderOut();
+}
+
+document.getElementById("manual").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  manual[MANUAL[b.dataset.i].name] = b.dataset.v;
+  renderManual();
+});
+
+function renderOut() {
+  const lines = [
+    "netcheck results — " + new Date().toLocaleString(),
+    "page: " + location.href,
+    "ua: " + navigator.userAgent,
+    "",
+    "AUTOMATIC",
+  ];
+  for (const t of AUTO) {
+    const r = results[t.name];
+    lines.push(`  ${r ? r.status.toUpperCase() : "PENDING"}  ${t.name} (${new URL(t.url).host})${r && r.detail ? " — " + r.detail : ""}`);
+  }
+  lines.push("", "MANUAL");
+  for (const m of MANUAL) lines.push(`  ${(manual[m.name] || "not checked").toUpperCase()}  ${m.name} (${new URL(m.url).host})`);
+  document.getElementById("out").value = lines.join("\n");
+}
+
+async function runAll() {
+  for (const k in results) delete results[k];
+  render();
+  await Promise.all(AUTO.map(async t => {
+    try {
+      const fn = t.kind === "json" ? probeJson : t.kind === "img" ? probeImg : probeWeak;
+      results[t.name] = { status: await fn(t.url) };
+    } catch (e) {
+      results[t.name] = { status: "blocked", detail: e.message };
+    }
+    render();
+  }));
+}
+
+document.getElementById("run").onclick = runAll;
+document.getElementById("copy").onclick = async () => {
+  const out = document.getElementById("out");
+  try { await navigator.clipboard.writeText(out.value); }
+  catch { out.select(); document.execCommand("copy"); }
+  document.getElementById("copy").textContent = "Copied ✓";
+};
+
+renderManual();
+runAll();
+</script>
+</body>
+</html>
